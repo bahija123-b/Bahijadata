@@ -1,10 +1,23 @@
-
+# Environnements
 .venv/
-
 .idea/
-
 __pycache__/
-
 *.pyc
+*.pyo
 
+# Archives
 *.zip
+*.tar.gz
+
+# OS X
+__MACOSX/
+.DS_Store
+
+# Logs et outputs
+*.log
+output/
+log_monitor/output/
+
+# Dossiers inutiles
+poc_snapshot01/data copy/
+poc_snapshot01/__MACOSX/
