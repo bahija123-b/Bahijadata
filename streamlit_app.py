@@ -1,6 +1,5 @@
 ﻿import os
 import tempfile
-from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -9,6 +8,7 @@ from plotly.subplots import make_subplots
 from sklearn.ensemble import IsolationForest
 
 from feature_engineering import extract_features
+
 
 st.set_page_config(
     page_title="Détection Anomalies Logs",
@@ -180,7 +180,7 @@ else:
 
         st.subheader("📌 Objectifs encadrant")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Profil normal", f"{summary['nb_windows']} fenêtres")
+        c1.metric("Fenêtres analysées", f"{summary['nb_windows']}")
         c2.metric("Anomalies détectées", summary["nb_anomalies"])
         c3.metric("Score max (0-1)", f"{summary['max_score_01']:.3f}")
         c4.metric("Type dominant", summary["dominant_type"])

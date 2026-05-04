@@ -1,1 +1,6 @@
-kafka-python==2.0.2
+streamlit
+pandas
+numpy
+plotly
+scikit-learn
+joblib
