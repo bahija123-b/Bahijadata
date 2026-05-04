@@ -2,7 +2,7 @@ import os
 import pandas as pd
 from datetime import datetime
 
-INPUT_CSV = "output/features_24mars.csv"
+INPUT_CSV = "output/features_with_scores.csv"
 ALERTS_LOG = "output/alerts.log"
 DIAGNOSTIC_CSV = "output/incident_diagnostic.csv"
 

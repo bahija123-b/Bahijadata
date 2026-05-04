@@ -1,11 +1,15 @@
+import joblib
+import numpy as np
 import json
 import time
 import socket
 import threading
+import pandas as pd
 from collections import deque, defaultdict
 from datetime import datetime
 
 from kafka import KafkaConsumer
+
 
 KAFKA_TOPIC = "webmethods.is.logs"
 KAFKA_BOOTSTRAP = "localhost:9092"
@@ -15,6 +19,8 @@ WINDOW_SECONDS = 60
 BURST_THRESHOLD = 10
 RETRY_LOOP_COUNT = 6
 RETRY_LOOP_WINDOW = 180
+IF_WINDOW_SECONDS = 300   # fenêtre Isolation Forest = 5 minutes
+IF_THRESHOLD = 0.70       # seuil score anomalie
 
 JMS_ENDPOINTS = {
     "GSIMTConnectionAlias": ("172.22.15.83", 9000),
@@ -66,10 +72,33 @@ class NetworkOutageDetector:
         self.retry_timestamps = deque()
         self._lock = threading.Lock()
 
+        # ── Isolation Forest ──────────────────────────────────────────
+        self.window_buffer = []
+        self.window_start_time = None
+        try:
+            self.if_model = joblib.load("models/isolation_forest_model.pkl")
+            print("[IF] Modèle Isolation Forest chargé avec succès.")
+        except FileNotFoundError:
+            self.if_model = None
+            print("[IF] ⚠️  Modèle non trouvé — lance d'abord train_isolation_forest.py")
+
     def _clean_window(self, code: str, now: float):
         cutoff = now - WINDOW_SECONDS
         while self.windows[code] and self.windows[code][0] < cutoff:
             self.windows[code].popleft()
+
+    # ── Scoring Isolation Forest sur fenêtre de 5 minutes ─────────────
+    def _score_window_if(self) -> float:
+        if not self.window_buffer or self.if_model is None:
+            return 0.0
+        nb_logs   = len(self.window_buffer)
+        nb_0020E  = sum(1 for e in self.window_buffer if e.get("error_code") == "ISS.0134.0020E")
+        nb_0042E  = sum(1 for e in self.window_buffer if e.get("error_code") == "ISS.0134.0042E")
+        nb_tids   = len(set(e.get("tid", "") for e in self.window_buffer if e.get("tid")))
+        X = np.array([[nb_logs, nb_0020E, nb_0042E, nb_tids, 0, 0, 0, 0, 0]])
+        raw = self.if_model.decision_function(X)[0]
+        score_01 = float(np.clip((-raw + 0.5) / 1.0, 0, 1))
+        return score_01
 
     def process_event(self, event: dict):
         code = event.get("error_code", "")
@@ -77,6 +106,31 @@ class NetworkOutageDetector:
         now = time.time()
         log_ts_str = event.get("timestamp", "")
 
+        # ── Fenêtre glissante Isolation Forest (5 minutes) ─────────────
+        now_ts = pd.Timestamp.now()
+        if self.window_start_time is None:
+            self.window_start_time = now_ts
+        self.window_buffer.append(event)
+
+        if (now_ts - self.window_start_time).total_seconds() >= IF_WINDOW_SECONDS:
+            score = self._score_window_if()
+            label = self.window_start_time.strftime("%H:%M")
+            print(f"[IF] Fenêtre {label} → score={score:.3f}", end="")
+            if score >= IF_THRESHOLD:
+                print(f"  ⚠️  ANOMALIE DÉTECTÉE (score={score:.3f} ≥ {IF_THRESHOLD})")
+                self.alerts_sent.append({
+                    "type": "IF_ANOMALY",
+                    "ts": label,
+                    "score": score,
+                    "details": {"score_if": score, "fenetre": label},
+                    "connectivity": {}
+                })
+            else:
+                print("  ✅ Normal")
+            self.window_buffer = []
+            self.window_start_time = now_ts
+
+        # ── Détection par règles (machine à états) ─────────────────────
         with self._lock:
             if code == "ISS.0134.0020E":
                 self.windows["0020E"].append(now)
@@ -120,9 +174,9 @@ class NetworkOutageDetector:
         if all_down:
             self.state = "OUTAGE"
         details = {
-            "Code erreur": "ISS.0134.0020E",
+            "Code erreur":    "ISS.0134.0020E",
             "Alias JMS ciblé": alias or "N/A",
-            "Timestamp log": log_ts,
+            "Timestamp log":  log_ts,
             "Heure détection": datetime.now().strftime("%H:%M:%S"),
             "État endpoints": "TOUS INJOIGNABLES" if all_down else "PARTIELLEMENT UP",
             "Action requise": "Vérifier réseau / UM server / VPN GSIM",
@@ -138,13 +192,13 @@ class NetworkOutageDetector:
         connectivity = check_all_endpoints()
         duration_min = int((datetime.now() - self.outage_start).total_seconds() // 60) if self.outage_start else 0
         details = {
-            "Type": "Impact virements confirmé",
-            "Erreurs 0042E": f"{burst_count} en {WINDOW_SECONDS}s",
-            "Durée coupure": f"{duration_min} minutes",
-            "Timestamp début": self.outage_start.strftime("%H:%M:%S") if self.outage_start else "?",
+            "Type":             "Impact virements confirmé",
+            "Erreurs 0042E":    f"{burst_count} en {WINDOW_SECONDS}s",
+            "Durée coupure":    f"{duration_min} minutes",
+            "Timestamp début":  self.outage_start.strftime("%H:%M:%S") if self.outage_start else "?",
             "Services impactés": "ABB_VIREMENTS_INSTANTANE / PacsOutRouter",
             "Trigger défaillant": event.get("service", "N/A"),
-            "Action requise": "Escalade ops + relance manuelle triggers",
+            "Action requise":   "Escalade ops + relance manuelle triggers",
         }
         alert_text = format_alert("IMPACT_VIREMENTS_CRITIQUES", details, connectivity)
         print(alert_text)
@@ -167,21 +221,26 @@ def run_consumer():
     print("=" * 70)
     print(f"Topic   : {KAFKA_TOPIC}")
     print(f"Broker  : {KAFKA_BOOTSTRAP}")
-    print(f"Seuils  : burst={BURST_THRESHOLD}/min | retry_loop={RETRY_LOOP_COUNT}/3min")
+    print(f"Seuils  : burst={BURST_THRESHOLD}/min | retry_loop={RETRY_LOOP_COUNT}/3min | IF={IF_THRESHOLD}")
     print("=" * 70)
     print()
 
     detector = NetworkOutageDetector()
 
-    consumer = KafkaConsumer(
-        KAFKA_TOPIC,
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        group_id=KAFKA_GROUP,
-        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        consumer_timeout_ms=10000,
-    )
+    try:
+        consumer = KafkaConsumer(
+            KAFKA_TOPIC,
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            group_id=KAFKA_GROUP,
+            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+            auto_offset_reset="earliest",
+            enable_auto_commit=True,
+            consumer_timeout_ms=10000,
+        )
+    except Exception as e:
+        print(f"[ERREUR] Kafka non disponible : {e}")
+        print("[INFO] Lance Kafka avant de démarrer le consumer.")
+        return
 
     print("[CONSUMER] En attente d'événements depuis Kafka...\n")
     events_processed = 0
@@ -199,7 +258,7 @@ def run_consumer():
         print("\n── Résumé de la session ───────────────────────────────────────")
         print(f"Événements traités : {events_processed}")
         print(f"État final         : {summary['state']}")
-        print(f"Alertes levées      : {summary['alerts_count']}")
+        print(f"Alertes levées     : {summary['alerts_count']}")
         for a in summary["alerts"]:
             print(f"→ [{a['type']}] {a['ts']}")
         print("───────────────────────────────────────────────────────────────")
